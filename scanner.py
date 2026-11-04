@@ -97,7 +97,12 @@ def fetch_index(url: str, cols: list[str]) -> tuple[list[str], dict[str, dict]]:
     """Returns (tickers, meta) where meta[ticker] = {name, sector, industry}."""
     r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; IBV-SM-Scanner/1.0)"}, timeout=30)
     r.raise_for_status()
-    for table in pd.read_html(StringIO(r.text)):
+    try:  # Wikipedia marks the member table with id="constituents" on both pages
+        tables = pd.read_html(StringIO(r.text), attrs={"id": "constituents"})
+    except ValueError:
+        tables = []
+    tables += pd.read_html(StringIO(r.text))
+    for table in tables:
         if len(table) < 90:
             continue
         if isinstance(table.columns, pd.MultiIndex):
@@ -154,6 +159,7 @@ def build_universe() -> tuple[list[str], list[str], list[str], dict[str, dict]]:
             notes.append(f"{name}: {len(tick)} symbols")
         except Exception as e:  # noqa: BLE001
             notes.append(f"{name}: could not load ({e.__class__.__name__})")
+            print(f"{name} load error: {e!r}", file=sys.stderr)
     if not index:
         index = read_list(EXTRA_INDEX_FILE)
         if index:
@@ -173,14 +179,14 @@ def download(tickers: list[str]) -> dict[str, pd.DataFrame]:
 
     data: dict[str, pd.DataFrame] = {}
     today_utc = dt.datetime.now(dt.timezone.utc).date()
-    for i in range(0, len(tickers), CHUNK):
-        chunk = tickers[i:i + CHUNK]
+
+    def grab(chunk: list[str], threads: bool) -> None:
         try:
             df = yf.download(chunk, period=HISTORY, interval="1d", group_by="ticker",
-                             auto_adjust=False, threads=True, progress=False)
+                             auto_adjust=False, threads=threads, progress=False)
         except Exception as e:  # noqa: BLE001
-            print(f"download error for chunk {i}: {e}", file=sys.stderr)
-            continue
+            print(f"download error: {e}", file=sys.stderr)
+            return
         for t in chunk:
             try:
                 sub = df[t] if isinstance(df.columns, pd.MultiIndex) else df
@@ -192,6 +198,14 @@ def download(tickers: list[str]) -> dict[str, pd.DataFrame]:
                 sub = sub.iloc[:-1]
             if len(sub) >= SMA_LEN + 2 * PIVOT_LEN:
                 data[t] = sub
+
+    for i in range(0, len(tickers), CHUNK):
+        grab(tickers[i:i + CHUNK], threads=True)
+    # One slower retry for anything that failed (e.g. "database is locked" cache errors)
+    retry = [t for t in tickers if t not in data]
+    if retry:
+        print(f"Retrying {len(retry)} symbols without threads", file=sys.stderr)
+        grab(retry, threads=False)
     return data
 
 
