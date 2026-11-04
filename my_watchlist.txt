@@ -1,0 +1,34 @@
+# Hector's watchlist — scanned every night in addition to the S&P 500 + Nasdaq-100.
+# One ticker per line. Anything after # is ignored.
+# Crypto uses Yahoo format (BTC-USD). Class shares: BRK.B works. Foreign: SHOP.TO, etc.
+
+BTC-USD   # Bitcoin
+ETH-USD   # Ethereum
+BMNR
+MSTR
+SOFI
+ON
+RKLB
+VIST
+VST
+NVTS
+CIFR
+RDW
+APLD
+DDO       # check: did you mean DDOG (Datadog)?
+WIX
+CEG
+CDNS
+FUBO
+BTQ
+AAOI
+INFQ
+IONQ
+RGTI
+UMAC
+ONDS
+OKLO
+RXRX
+BEAM
+ISRG
+TEM
