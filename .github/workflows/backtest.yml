@@ -1,0 +1,36 @@
+name: IBV-SM Backtest
+
+on:
+  workflow_dispatch:   # run manually from the Actions tab
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backtest and email report
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python backtest.py
+
+      - name: Save report and trade list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibv-backtest
+          path: |
+            backtest_report.html
+            backtest_trades.csv
+          retention-days: 90
