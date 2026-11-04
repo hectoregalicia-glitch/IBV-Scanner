@@ -23,7 +23,12 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python backtest.py
+        run: |
+          echo "Repository files:"; find . -path ./.git -prune -o -type f -print
+          f=$(find . -name 'backtest.py' -not -path './.git/*' | head -1)
+          if [ -z "$f" ]; then echo "backtest.py is not in the repository"; exit 1; fi
+          echo "Running $f"
+          PYTHONPATH="$GITHUB_WORKSPACE:$(dirname "$f")" python "$f"
 
       - name: Save report and trade list
         if: always()
