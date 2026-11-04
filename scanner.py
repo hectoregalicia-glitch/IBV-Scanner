@@ -234,7 +234,10 @@ def rsi_wilder(close: np.ndarray, length: int = 14) -> np.ndarray:
 
 
 # ── Core logic (bar-by-bar port of the Pine script) ─────────────────────────
-def analyze(df: pd.DataFrame) -> dict:
+def analyze(df: pd.DataFrame, history: bool = False) -> dict:
+    """Last-bar snapshot. With history=True, also returns per-bar arrays under 'hist'
+    (used by backtest.py so the backtest runs the exact same logic as the scanner)."""
+    H = {k: [] for k in ("zone", "entered", "bull_ok", "z1", "z2", "z3", "leg_hi", "leg_lo")} if history else None
     h = df["High"].to_numpy(float)
     lo = df["Low"].to_numpy(float)
     c = df["Close"].to_numpy(float)
@@ -360,6 +363,15 @@ def analyze(df: pd.DataFrame) -> dict:
             trig_bar, trig_price, trig_zone = i, c[i], zone
         prev_leg = (leg_hi, leg_lo)
         prev_zone = zone
+        if H is not None:
+            H["zone"].append(zone)
+            H["entered"].append(entered)
+            H["bull_ok"].append(bull_ok)
+            H["z1"].append(z1 if z1 is not None else np.nan)
+            H["z2"].append(z2 if z2 is not None else np.nan)
+            H["z3"].append(z3 if z3 is not None else np.nan)
+            H["leg_hi"].append(leg_hi if leg_hi is not None else np.nan)
+            H["leg_lo"].append(leg_lo if leg_lo is not None else np.nan)
 
     def d(idx):
         return dates[idx].strftime("%Y-%m-%d") if idx is not None else ""
@@ -401,6 +413,7 @@ def analyze(df: pd.DataFrame) -> dict:
         "_lo_bar": leg_lo_bar,
         "_hi_bar": leg_hi_bar,
         "_trig_bar": trig_bar,
+        **({"hist": {k: np.asarray(v) for k, v in H.items()}} if H is not None else {}),
     }
 
 
@@ -725,7 +738,8 @@ Ticker links open TradingView. Not investment advice.</p>
     return subject, body, images
 
 
-def send_email(subject: str, body: str, csv_bytes: bytes, images: list[tuple[str, bytes]]) -> None:
+def send_email(subject: str, body: str, csv_bytes: bytes, images: list[tuple[str, bytes]],
+               csv_name: str | None = None) -> None:
     # Strip ALL whitespace (incl. non-breaking spaces / newlines picked up when pasting)
     user = re.sub(r"\s", "", os.environ["EMAIL_USER"])
     pwd = re.sub(r"\s", "", os.environ["EMAIL_APP_PASSWORD"])
@@ -744,7 +758,7 @@ def send_email(subject: str, body: str, csv_bytes: bytes, images: list[tuple[str
     for cid, png in images:
         html_part.add_related(png, maintype="image", subtype="png", cid=f"<{cid}>")
     msg.add_attachment(csv_bytes, maintype="text", subtype="csv",
-                       filename=f"ibv_scan_{dt.date.today().isoformat()}.csv")
+                       filename=csv_name or f"ibv_scan_{dt.date.today().isoformat()}.csv")
     ctx = ssl.create_default_context()
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=60) as s:
