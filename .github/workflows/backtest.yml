@@ -1,7 +1,7 @@
 name: IBV-SM Backtest
 
 on:
-  workflow_dispatch:   # run manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   backtest:
@@ -13,7 +13,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -24,7 +23,8 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
-          echo "Repository files:"; find . -path ./.git -prune -o -type f -print
+          echo "Repository files:"
+          find . -path ./.git -prune -o -type f -print
           f=$(find . -name 'backtest.py' -not -path './.git/*' | head -1)
           if [ -z "$f" ]; then echo "backtest.py is not in the repository"; exit 1; fi
           echo "Running $f"
@@ -36,6 +36,6 @@ jobs:
         with:
           name: ibv-backtest
           path: |
-            backtest_report.html
-            backtest_trades.csv
+            **/backtest_report.html
+            **/backtest_trades.csv
           retention-days: 90
