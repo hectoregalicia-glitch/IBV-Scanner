@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IBV / SM Backtest v2 — exit-strategy comparison + "core holding" rule
+IBV / SM Backtest v3 — exit strategies, realistic runners, multiple markets
 ---------------------------------------------------------------------
 Same buy signal as scanner.py (daily close enters IBV 0.618-0.786 or SM 0.786-0.826 in a
 bullish trend). What changes is HOW and WHEN we sell. Nine strategies are tested side by side,
@@ -34,6 +34,14 @@ each against a random-entry control that uses the identical selling rules.
                           then hold the rest until a weekly break of structure
   N  20% trailing stop    nothing but a broker-style trailing stop 20% below the highest price
                           since entry (triggers intraday; gaps fill at the open)
+  O-R Realistic runners   H/I logic (+25% or +50% becomes core) run in a two-bucket portfolio:
+                          trading bucket sized by risk (1% of the account to the stop, max 10% per
+                          trade, 10 slots); core bucket capped at 15% per stock and 40% in total.
+                          Core exit: weekly close below the 30-week MA (O, Q) or 35% off the peak (P, R).
+  Robustness: every strategy is re-run without its 10 best trades, and its trades are replayed
+  in random order to estimate a 1-in-20 worst drop. Universe: S&P 500, Nasdaq-100, S&P 400,
+  S&P 600, US-listed international stocks and the TSX 60 (see BT_GROUPS), with trading costs
+  from 0.10% to 0.40% depending on the group.
 
 Fair-play rules
   - Entry next day's open; stops/trails act on the close and exit next open; 0.10% round trip.
@@ -65,7 +73,21 @@ import scanner as s
 DATA_START = "2011-01-01"
 SIGNAL_START = "2012-01-01"
 OOS_START = "2020-01-01"
-COST_PCT = 0.10
+# Which stock groups to test (see UNIVERSE_SOURCES in scanner.py). Remove any you don't want.
+BT_GROUPS = ["sp500", "nasdaq100", "sp400", "sp600", "adrs", "tsx60"]
+# Round-trip trading cost by group (%): small, mid and foreign-listed stocks cost more to trade.
+COST_BY_GROUP = {"S&P 500": 0.10, "Nasdaq-100": 0.10, "International (US-listed)": 0.15,
+                 "Mid cap (S&P 400)": 0.25, "Small cap (S&P 600)": 0.40, "Canada (TSX 60)": 0.25,
+                 "UK (FTSE 100)": 0.40, "Germany (DAX)": 0.40, "Watchlist": 0.40}
+COST_PCT = 0.10                    # default when a stock has no group
+# Realistic portfolio (strategies O-R and B-real): two buckets, risk-based sizing, size caps
+RISK_PER_TRADE = 0.01              # risk 1% of the account between entry and stop
+MAX_TRADE_PCT = 0.10               # no new trade bigger than 10% of the account
+MAX_TRADING_POS = 10               # open trades in the trading bucket
+CORE_NAME_CAP = 0.15               # trim a core holding back to 15% of the account
+CORE_TOTAL_CAP = 0.40              # all core holdings together at most 40%
+TOP_N_REMOVED = 10                 # robustness: rerun without the best N trades
+MC_RUNS = 500                      # reshuffled-order simulations for the worst-drop range
 CONTROL_MULT = 3
 MAX_POS, POS_PCT, START_CAPITAL = 10, 0.10, 100_000
 MAX_HOLD = 500                     # safety cap for non-core trades (~2 years)
@@ -91,7 +113,17 @@ STRATS = {
     "M": dict(name="Claude's pick: filtered entry, weekly trail", stop="leg_lo", special="htf", htf="w",
               pre="static", switch_gain=0.25, repeat=False, filter=True),
     "N": dict(name="20% trailing stop only", stop="none", special="tpct", pct=0.20),
+    # Realistic runners (two-bucket portfolio, risk sizing, 15% / 40% caps, higher small-cap costs)
+    "O": dict(name="Runner +25%, core exit: weekly 30-wk MA", stop="leg_lo", trail="ma50", core=0.25,
+              core_exit="w30", real=True),
+    "P": dict(name="Runner +25%, core exit: 35% off peak", stop="leg_lo", trail="ma50", core=0.25,
+              core_exit="dd35", real=True),
+    "Q": dict(name="Runner +50%, core exit: weekly 30-wk MA", stop="leg_lo", trail="ma50", core=0.50,
+              core_exit="w30", real=True),
+    "R": dict(name="Runner +50%, core exit: 35% off peak", stop="leg_lo", trail="ma50", core=0.50,
+              core_exit="dd35", real=True),
 }
+REAL_SIZING_EXTRA = ["B"]          # also run these through the realistic portfolio for comparison
 # Note: in the portfolio simulation a partly-sold trade (G, J) is held whole until its final sale at the
 # blended price, which slightly overstates how long capital is tied up.
 BASELINE = "A"
@@ -102,7 +134,7 @@ C = s.C
 
 # ── Data ────────────────────────────────────────────────────────────────────
 def load():
-    universe, watch, notes, meta = s.build_universe()
+    universe, watch, notes, meta = s.build_universe(BT_GROUPS)
     if not INCLUDE_CRYPTO:
         universe = [t for t in universe if not t.endswith("-USD")]
     s.HISTORY = "max"
@@ -145,6 +177,8 @@ def simulate(px: dict, e: int, stop: float, target: float | None, cfg: dict):
     trail, time_exit, core_thr, half = cfg.get("trail"), cfg.get("time"), cfg.get("core"), cfg.get("half", False)
     armed = False            # trail activates after a close above the 50-day MA
     core = False
+    core_bar, core_peak = None, None
+    core_exit = cfg.get("core_exit", "ma200")
     peak = c[e]
     half_px = None
 
@@ -154,9 +188,18 @@ def simulate(px: dict, e: int, stop: float, target: float | None, cfg: dict):
     for j in range(e, n):
         peak = max(peak, c[j])
         if core:
-            if np.isfinite(ma200[j]) and c[j] < ma200[j]:
+            core_peak = max(core_peak, c[j])
+            out = False
+            if core_exit == "ma200":
+                out = np.isfinite(ma200[j]) and c[j] < ma200[j]
+            elif core_exit == "w30":
+                out = px["wk_end"][j] and np.isfinite(px["w30"][j]) and c[j] < px["w30"][j]
+            elif core_exit == "dd35":
+                out = c[j] < 0.65 * core_peak
+            if out:
                 xb, xp = nxt(j)
-                return dict(exit_bar=xb, exit_px=xp, reason="core exit (200D)", core=True, half_px=half_px)
+                return dict(exit_bar=xb, exit_px=xp, reason=f"core exit ({core_exit})", core=True,
+                            half_px=half_px, core_bar=core_bar)
             continue
         # hard stop
         if c[j] < stop:
@@ -188,11 +231,26 @@ def simulate(px: dict, e: int, stop: float, target: float | None, cfg: dict):
             return dict(exit_bar=j, exit_px=c[j], reason="time", core=False, half_px=half_px)
         # promote to core
         if core_thr and c[j] >= entry * (1 + core_thr):
-            core = True
+            core, core_bar, core_peak = True, j, c[j]
             continue
         if j - e + 1 >= MAX_HOLD:
             return dict(exit_bar=j, exit_px=c[j], reason="max hold", core=False, half_px=half_px)
-    return dict(exit_bar=None, exit_px=c[-1], reason="open", core=core, half_px=half_px)
+    return dict(exit_bar=None, exit_px=c[-1], reason="open", core=core, half_px=half_px, core_bar=core_bar)
+
+
+def weekly_ma(df: pd.DataFrame, weeks: int = 30):
+    """30-week moving average of weekly closes, placed on the last trading day of each week."""
+    key = df.index.to_period("W-FRI")
+    pos = pd.Series(np.arange(len(df)), index=df.index)
+    g = pd.DataFrame({"c": df["Close"].to_numpy(), "pos": pos.to_numpy()}, index=df.index).groupby(key)
+    wc = g["c"].last()
+    ends = g["pos"].max().to_numpy()
+    ma = wc.rolling(weeks).mean().to_numpy()
+    out = np.full(len(df), np.nan)
+    out[ends] = ma
+    is_end = np.zeros(len(df), bool)
+    is_end[ends] = True
+    return out, is_end
 
 
 HTF_PIVOT = {"w": 3, "m": 2}          # swing confirmation: 3 weeks / 2 months each side
@@ -318,8 +376,9 @@ def simulate_j(px: dict, e: int, stop: float):
                 reason="open (partly sold)" if trimmed else "open", core=trimmed, half_px=None)
 
 
-def run_trades(t, df, hist, px, entries, key, kind):
+def run_trades(t, df, hist, px, entries, key, kind, cost=None):
     cfg = STRATS[key]
+    cost = COST_PCT if cost is None else cost
     dates = df.index
     n = len(df)
     rows, busy_until = [], -1
@@ -332,8 +391,9 @@ def run_trades(t, df, hist, px, entries, key, kind):
         hi, lo_, z3 = hist["leg_hi"][i], hist["leg_lo"][i], hist["z3"][i]
         stop = z3 if cfg["stop"] == "z3" else (-np.inf if cfg["stop"] == "none" else lo_)
         target = {"hi": hi, None: None}[cfg.get("target")]
-        entry = px["o"][e] * (1 + COST_PCT / 200)
-        if not np.isfinite(stop) or entry <= stop or (target is not None and entry >= target):
+        entry = px["o"][e] * (1 + cost / 200)
+        # stop = -inf means "no stop" (strategy N); only a missing (NaN) stop level is skipped
+        if np.isnan(stop) or entry <= stop or (target is not None and entry >= target):
             continue
         sp = cfg.get("special")
         if sp == "bos_ath":
@@ -347,7 +407,7 @@ def run_trades(t, df, hist, px, entries, key, kind):
         xp = r["exit_px"]
         if r["half_px"] is not None:
             xp = 0.5 * r["half_px"] + 0.5 * xp
-        xp *= (1 - COST_PCT / 200)
+        xp *= (1 - cost / 200)
         xb = r["exit_bar"]
         busy_until = xb if xb is not None else n
         last = xb if xb is not None else n - 1
@@ -358,6 +418,7 @@ def run_trades(t, df, hist, px, entries, key, kind):
             "exit_date": dates[xb] if xb is not None else pd.NaT,
             "entry": entry, "stop": stop, "exit": xp, "reason": r["reason"],
             "became_core": bool(r["core"]), "open": xb is None,
+            "core_date": dates[r["core_bar"]] if r.get("core_bar") is not None else pd.NaT,
             "days": last - e + 1, "ret_pct": (xp / entry - 1) * 100, "rsi": hist["rsi"][i],
         })
     return rows
@@ -394,13 +455,18 @@ def trade_stats(df: pd.DataFrame) -> dict:
     }
 
 
-def portfolio(trades: pd.DataFrame, closes: dict, days: pd.DatetimeIndex) -> tuple[pd.Series, int]:
+def _order(trades: pd.DataFrame) -> dict:
     tr = trades.copy()
     tr["prio"] = tr["zone"].map({"SM": 0, "IBV": 1}).fillna(2)
     tr = tr.sort_values(["entry_date", "prio", "rsi"])
-    by_entry = {d: g for d, g in tr.groupby("entry_date")}
+    return {d: g for d, g in tr.groupby("entry_date")}
+
+
+def portfolio(trades: pd.DataFrame, px_by_day: dict, days: pd.DatetimeIndex) -> tuple[pd.Series, int]:
+    """Simple portfolio: up to MAX_POS positions at POS_PCT of equity each, marked to market daily."""
+    by_entry = _order(trades)
     cash, pos, curve, taken, equity = START_CAPITAL, [], [], 0, START_CAPITAL
-    for d in days:
+    for i, d in enumerate(days):
         keep = []
         for p in pos:
             if pd.notna(p["exit_date"]) and p["exit_date"] <= d:
@@ -408,22 +474,97 @@ def portfolio(trades: pd.DataFrame, closes: dict, days: pd.DatetimeIndex) -> tup
             else:
                 keep.append(p)
         pos = keep
-        for _, r in by_entry.get(d, pd.DataFrame()).iterrows():
-            if len(pos) >= MAX_POS:
-                break
-            alloc = min(POS_PCT * equity, cash)
-            if alloc <= 0:
-                break
-            cash -= alloc
-            pos.append({"t": r["ticker"], "shares": alloc / r["entry"], "exit": r["exit"], "exit_date": r["exit_date"]})
-            taken += 1
+        g = by_entry.get(d)
+        if g is not None:
+            for r in g.itertuples():
+                if len(pos) >= MAX_POS:
+                    break
+                alloc = min(POS_PCT * equity, cash)
+                if alloc <= 0:
+                    break
+                cash -= alloc
+                pos.append({"t": r.ticker, "shares": alloc / r.entry, "exit": r.exit, "exit_date": r.exit_date})
+                taken += 1
         mv = 0.0
         for p in pos:
-            v = closes[p["t"]].asof(d)
+            v = px_by_day[p["t"]][i]
             mv += p["shares"] * (v if v == v else 0)
         equity = cash + mv
         curve.append(equity)
     return pd.Series(curve, index=days), taken
+
+
+def portfolio_real(trades: pd.DataFrame, px_by_day: dict, days: pd.DatetimeIndex) -> tuple[pd.Series, int]:
+    """Realistic portfolio with two buckets.
+    Trading bucket: up to MAX_TRADING_POS open trades, each sized so a stop-out loses RISK_PER_TRADE of the
+    account (never more than MAX_TRADE_PCT of the account). Once a trade becomes core it leaves the trading
+    bucket, freeing a slot. Core bucket: any holding above CORE_NAME_CAP of the account is trimmed back at the
+    close, and all core holdings together are trimmed to CORE_TOTAL_CAP."""
+    by_entry = _order(trades)
+    cash, pos, curve, taken, equity = START_CAPITAL, [], [], 0, START_CAPITAL
+    for i, d in enumerate(days):
+        keep = []
+        for p in pos:
+            if pd.notna(p["exit_date"]) and p["exit_date"] <= d:
+                cash += p["shares"] * p["exit"]
+            else:
+                keep.append(p)
+        pos = keep
+        price = {id(p): px_by_day[p["t"]][i] for p in pos}
+        core = [p for p in pos if pd.notna(p["core_date"]) and p["core_date"] <= d and price[id(p)] == price[id(p)]]
+        if core:
+            for p in core:                                   # per-name cap
+                v = p["shares"] * price[id(p)]
+                if v > CORE_NAME_CAP * equity:
+                    sell = (v - CORE_NAME_CAP * equity) / price[id(p)]
+                    p["shares"] -= sell
+                    cash += sell * price[id(p)]
+            tot = sum(p["shares"] * price[id(p)] for p in core)   # bucket cap
+            if tot > CORE_TOTAL_CAP * equity:
+                k = CORE_TOTAL_CAP * equity / tot
+                for p in core:
+                    sell = p["shares"] * (1 - k)
+                    p["shares"] -= sell
+                    cash += sell * price[id(p)]
+        g = by_entry.get(d)
+        if g is not None:
+            n_trading = sum(1 for p in pos if not (pd.notna(p["core_date"]) and p["core_date"] <= d))
+            for r in g.itertuples():
+                if n_trading >= MAX_TRADING_POS:
+                    break
+                per_share_risk = r.entry - r.stop if np.isfinite(r.stop) and r.stop > 0 else 0.2 * r.entry
+                shares = min(RISK_PER_TRADE * equity / max(per_share_risk, 1e-9), MAX_TRADE_PCT * equity / r.entry)
+                alloc = min(shares * r.entry, cash)
+                if alloc <= 0:
+                    break
+                cash -= alloc
+                pos.append({"t": r.ticker, "shares": alloc / r.entry, "exit": r.exit, "exit_date": r.exit_date,
+                            "core_date": r.core_date})
+                n_trading += 1
+                taken += 1
+        mv = 0.0
+        for p in pos:
+            v = px_by_day[p["t"]][i]
+            mv += p["shares"] * (v if v == v else 0)
+        equity = cash + mv
+        curve.append(equity)
+    return pd.Series(curve, index=days), taken
+
+
+def mc_worst_drop(rets_pct: np.ndarray, runs: int = MC_RUNS, seed: int = SEED) -> float:
+    """Replay the trades in random order, 10 at a time (a fully invested 10-position account),
+    and return the 95th-percentile worst drop. Shows how bad the worst drop could plausibly be."""
+    r = np.asarray(rets_pct, float) / 100
+    if len(r) < 20:
+        return np.nan
+    rng = np.random.default_rng(seed)
+    n = len(r) // 10 * 10
+    worst = []
+    for _ in range(runs):
+        x = rng.permutation(r)[:n].reshape(-1, 10).mean(axis=1)
+        eq = np.cumprod(1 + x)
+        worst.append((eq / np.maximum.accumulate(eq) - 1).min())
+    return 100 * np.percentile(worst, 5)
 
 
 def perf(eq: pd.Series) -> dict:
@@ -465,7 +606,7 @@ def chart_equity(curves: dict, spy_eq: pd.Series, best: str):
         hl = k in (best, BASELINE)
         ax.plot(a.index, a, color=C["sma50"] if k == best else C["ink2"] if k == BASELINE else C["grid"],
                 linewidth=1.5 if hl else 0.8, zorder=3 if hl else 1,
-                label=f"{k} {STRATS[k]['name']}" if hl else None)
+                label=f"{k} {STRATS[k.split('-')[0]]['name']}" if hl else None)
         if hl:
             ax.annotate(f"{k} {a.iloc[-1]:.0f}", xy=(a.index[-1], a.iloc[-1]), xytext=(4, 0),
                         textcoords="offset points", va="center", fontsize=6.8, color=C["ink2"])
@@ -552,6 +693,9 @@ def main() -> int:
         px["spy_up"] = spy_up.reindex(df.index).ffill().fillna(False).to_numpy(bool)
         prev_max = pd.Series(c).cummax().shift(1).to_numpy()
         px["ath_before"] = np.fmax(np.nan_to_num(prev_max, nan=-np.inf), PRIOR_ATH.get(t, -np.inf))
+        px["w30"], px["wk_end"] = weekly_ma(df, 30)
+        grp = meta.get(t, {}).get("groups", [])
+        cost = min([COST_BY_GROUP.get(g_, COST_PCT) for g_ in grp], default=COST_PCT)
         ok_time = df.index >= SIGNAL_START
         bull = hist["bull_ok"].astype(bool) & ok_time
         sig = np.where(hist["entered"].astype(bool) & np.isin(hist["zone"], [1, 2]) & ok_time)[0]
@@ -559,8 +703,8 @@ def main() -> int:
         k = min(len(base), CONTROL_MULT * len(sig))
         ctl = np.sort(rng.choice(base, k, replace=False)) if k else np.array([], int)
         for key in STRATS:
-            sig_rows += run_trades(t, df, hist, px, sig, key, "signal")
-            ctl_rows += run_trades(t, df, hist, px, ctl, key, "control")
+            sig_rows += run_trades(t, df, hist, px, sig, key, "signal", cost)
+            ctl_rows += run_trades(t, df, hist, px, ctl, key, "control", cost)
         o = px["o"]
         spy_cl = spy_c.reindex(df.index).ffill().to_numpy(float)
         spy_op = spy["Open"].reindex(df.index).ffill().to_numpy(float)
@@ -581,39 +725,55 @@ def main() -> int:
     S["spy_up"] = S["signal_date"].map(lambda d: bool(spy_up.asof(d)))
     S["filtered"] = S["spy_up"] & (S["rsi"] <= 50)
 
-    closes = {t: d["Close"] for t, d in data.items()}
     days = spy.index[spy.index >= SIGNAL_START]
+    px_by_day = {t: d["Close"].reindex(days).ffill().to_numpy(float) for t, d in data.items()}
+    group_of = {t: ", ".join(meta.get(t, {}).get("groups", [])) for t in data}
+    S["groups"] = S["ticker"].map(group_of)
     spy_eq = spy_c.reindex(days).ffill()
     spy_perf = perf(spy_eq)
 
     summary, curves, detail = [], {}, []
-    for key, cfg in STRATS.items():
-        g, gc = S[S["strategy"] == key], K[K["strategy"] == key]
+    runs = [(k, k, STRATS[k].get("real", False)) for k in STRATS]
+    runs += [(f"{k}-real", k, True) for k in REAL_SIZING_EXTRA]
+    for key, base_key, real in runs:
+        cfg = STRATS[base_key]
+        g, gc = S[S["strategy"] == base_key], K[K["strategy"] == base_key]
+        if g.empty:
+            continue
         edge, t = welch(g["ret_pct"], gc["ret_pct"])
-        eq, taken = portfolio(g, closes, days)
+        pf = portfolio_real if real else portfolio
+        eq, taken = pf(g, px_by_day, days)
         curves[key] = eq
         p = perf(eq)
+        top = g.nlargest(TOP_N_REMOVED, "ret_pct").index
+        eq_x, _ = pf(g.drop(index=top), px_by_day, days)
+        p_x = perf(eq_x)
         row = {
             "Trades": len(g), "Avg % / trade": g["ret_pct"].mean(), "Random entries %": gc["ret_pct"].mean(),
             "Edge %": edge, "Edge t": t,
             "2012–19 %": g.loc[~g["oos"], "ret_pct"].mean(), "2020+ %": g.loc[g["oos"], "ret_pct"].mean(),
             "Filtered %": g.loc[g["filtered"], "ret_pct"].mean(),
             "CAGR %": p["CAGR %"], "Max DD %": p["Max drawdown %"], "Sharpe": p["Sharpe"],
+            f"CAGR w/o top {TOP_N_REMOVED} %": p_x["CAGR %"],
+            "Reshuffled worst DD %": mc_worst_drop(g["ret_pct"].to_numpy()),
+            "Sizing": "realistic" if real else "10% each",
         }
         summary.append((key, row))
-        detail.append((f"{key} {cfg['name']}", trade_stats(g)))
+        if key == base_key:
+            detail.append((f"{key} {cfg['name']}", trade_stats(g)))
 
     # Best = highest portfolio Sharpe among strategies whose edge is significant and positive in both periods
     def score(item):
         k, r = item
-        ok = (r["Edge t"] or 0) >= 2 and (r["2012–19 %"] or 0) > 0 and (r["2020+ %"] or 0) > 0
+        ok = ((r["Edge t"] or 0) >= 2 and (r["2012–19 %"] or 0) > 0 and (r["2020+ %"] or 0) > 0
+              and (r[f"CAGR w/o top {TOP_N_REMOVED} %"] or 0) > 0)
         return (ok, r["Sharpe"] if np.isfinite(r["Sharpe"]) else -9)
     best_key, best = max(summary, key=score)
     best_ok = score((best_key, best))[0]
     base_row = dict(summary)[BASELINE]
 
     lines = [
-        f"<b>{'Best strategy' if best_ok else 'Highest Sharpe ratio'}: {best_key} — {STRATS[best_key]['name']}.</b> "
+        f"<b>{'Best strategy' if best_ok else 'Highest Sharpe ratio'}: {best_key} — {STRATS[best_key.split('-')[0]]['name']}.</b> "
         f"{best['Avg % / trade']:+.2f}% per trade vs {best['Random entries %']:+.2f}% for random entries "
         f"(edge {best['Edge %']:+.2f}%, t = {best['Edge t']:.1f}); 2012–19 {best['2012–19 %']:+.2f}%, 2020+ {best['2020+ %']:+.2f}%.",
         f"Portfolio: {best['CAGR %']:.1f}% a year, worst drop {best['Max DD %']:.1f}%, Sharpe {best['Sharpe']:.2f} — "
@@ -628,8 +788,11 @@ def main() -> int:
                  "❌ It did not beat SPY on both return and risk-adjusted return — buying and holding SPY was as good or better.")
 
     cols = ["Trades", "Avg % / trade", "Random entries %", "Edge %", "Edge t", "2012–19 %", "2020+ %",
-            "Filtered %", "CAGR %", "Max DD %", "Sharpe"]
-    srows = [(f"{k} {STRATS[k]['name']}", r) for k, r in summary] + [("SPY buy & hold", {
+            "Filtered %", "CAGR %", "Max DD %", "Sharpe", f"CAGR w/o top {TOP_N_REMOVED} %", "Reshuffled worst DD %"]
+    def label(k):
+        b_ = k.split("-")[0]
+        return f"{k} {STRATS[b_]['name']}" + (" (realistic sizing)" if k.endswith("-real") else "")
+    srows = [(label(k), r) for k, r in summary] + [("SPY buy & hold", {
         "CAGR %": spy_perf["CAGR %"], "Max DD %": spy_perf["Max drawdown %"], "Sharpe": spy_perf["Sharpe"]})]
     dcols = list(detail[0][1].keys())
 
@@ -656,20 +819,41 @@ def main() -> int:
             "Only buys when SPY is above its 200-day MA and RSI ≤ 50. Net at the swing low; at +25% or a new all-time high "
             "sell 25% once, then hold the rest until a weekly break of structure",
             "No other rules: a trailing stop 20% below the highest price since buying; sells only when it is hit",
+            "Like H (+25% becomes core) in the realistic portfolio; core sold on a weekly close below the 30-week MA",
+            "Like H in the realistic portfolio; core sold on a close 35% below its highest close since becoming core",
+            "Like I (+50% becomes core) in the realistic portfolio; core sold on a weekly close below the 30-week MA",
+            "Like I in the realistic portfolio; core sold on a close 35% below its highest close since becoming core",
         ]))
 
+    # Results by stock group, per trade (signal trades)
+    gl = sorted({g_ for t_ in data for g_ in meta.get(t_, {}).get("groups", [])})
+    show = [k for k in ["B", "E", "H", "I", "N", "O", "P", "Q", "R"] if k in STRATS]
+    grows = []
+    for g_ in gl:
+        r_ = {}
+        for k in show:
+            sub = S[(S["strategy"] == k) & S["groups"].str.contains(g_, regex=False)]
+            r_[f"{k} trades"] = len(sub)
+            r_[f"{k} avg %"] = sub["ret_pct"].mean() if len(sub) else np.nan
+        grows.append((g_, r_))
+    gcols = [c_ for k in show for c_ in (f"{k} trades", f"{k} avg %")]
+
     body = f"""<html><head><style>{CSS}</style></head><body>
-<h1 style="font-size:20px;margin-bottom:2px">IBV / SM Backtest v2 — When to sell</h1>
+<h1 style="font-size:20px;margin-bottom:2px">IBV / SM Backtest v3 — When to sell, across markets</h1>
 <p class="sub">{len(data)} stocks · signals {first_d} → {last_d} · same buy signal for every strategy · entry next open ·
-{COST_PCT}% round-trip costs · open trades marked at the last close</p>
+round-trip costs 0.10% (large caps) to 0.40% (small caps) · open trades marked at the last close</p>
 
 <h2>Verdict</h2>
 <div class="verdict">{'<br>'.join(lines)}</div>
 
 <h2>1 · All strategies side by side</h2>
 <p class="sub">Edge = average % per trade minus random uptrend entries with the same selling rules (t ≥ 2 = meaningful).
-"Filtered" = only signals with SPY above its 200-day MA and RSI ≤ 50. CAGR / Max DD / Sharpe = portfolio of max
-{MAX_POS} positions at {POS_PCT:.0%} each.</p>
+"Filtered" = only signals with SPY above its 200-day MA and RSI ≤ 50. CAGR / Max DD / Sharpe: A–N use up to
+{MAX_POS} positions at {POS_PCT:.0%} each; O–R and "B-real" use the realistic portfolio (risk {RISK_PER_TRADE:.0%} per trade,
+max {MAX_TRADE_PCT:.0%} per new trade, {MAX_TRADING_POS} trading slots, winners move to a core bucket capped at
+{CORE_NAME_CAP:.0%} per stock and {CORE_TOTAL_CAP:.0%} in total). "CAGR w/o top {TOP_N_REMOVED}" = the same portfolio with
+its {TOP_N_REMOVED} best trades removed (does it still work without the lottery tickets?). "Reshuffled worst DD" =
+the 1-in-20 worst drop when the trades are replayed in random order.</p>
 {table(srows, cols, "Strategy")}
 <img class="chart" src="cid:bt-equity" width="640">
 
@@ -678,16 +862,21 @@ def main() -> int:
 all profit came from the best tenth of trades (higher = more reliant on big winners).</p>
 {table(detail, dcols, "Strategy")}
 
-<h2>3 · Does the zone keep working the longer you hold?</h2>
+<h2>3 · Results by stock group (average % per trade)</h2>
+<p class="sub">Same signals split by where the stock comes from. A stock in two groups counts in both.</p>
+{table(grows, gcols, "Group")}
+
+<h2>4 · Does the zone keep working the longer you hold?</h2>
 <img class="chart" src="cid:bt-fwd" width="640">
 
-<h2>4 · The strategies</h2>
+<h2>5 · The strategies</h2>
 <table><tr><th></th><th>Name</th><th>Selling rule (all buy on the next open after a zone close)</th></tr>{rules_html}</table>
 
 <p class="sub" style="margin-top:18px;font-size:12.5px;line-height:1.55">
 • Pick a strategy that is good in <b>both</b> periods and beats random entries — not just the biggest number.<br>
-• Survivorship bias: the stock list is today's index members, which flatters long holds most. Compare strategies to
-each other and to SPY, and expect less in live trading.<br>
+• Survivorship bias: the stock lists are today's members, which flatters long holds and small caps most. Compare
+strategies to each other and to SPY, and expect less in live trading.<br>
+• Non-US stocks listed abroad (e.g. TSX) are in local currency; US-listed international stocks are in dollars.<br>
 • Not investment advice. Full trade list attached (CSV).</p>
 <p class="sub">Universe: {html.escape(' · '.join(notes))}</p>
 </body></html>"""
@@ -695,7 +884,8 @@ each other and to SPY, and expect less in live trading.<br>
     out = S.drop(columns=["spy_up"]).round({"entry": 4, "stop": 4, "exit": 4, "ret_pct": 3, "rsi": 1})
     csv_bytes = out.to_csv(index=False).encode()
     (BASE / "backtest_trades.csv").write_bytes(csv_bytes)
-    subject = (f"IBV/SM Backtest v2: {'best' if best_ok else 'top Sharpe (unproven)'} = {best_key} {STRATS[best_key]['name']} · "
+    subject = (f"IBV/SM Backtest v3: {'best' if best_ok else 'top Sharpe (unproven)'} = {best_key} "
+               f"{STRATS[best_key.split('-')[0]]['name']} · "
                f"CAGR {best['CAGR %']:.1f}% vs SPY {spy_perf['CAGR %']:.1f}% · Sharpe {best['Sharpe']:.2f} vs {spy_perf['Sharpe']:.2f}")
 
     if os.environ.get("DRY_RUN") == "1" or not os.environ.get("EMAIL_USER"):
