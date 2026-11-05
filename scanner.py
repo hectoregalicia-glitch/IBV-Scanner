@@ -57,17 +57,41 @@ BASE = Path(__file__).resolve().parent
 WATCHLIST_FILE = BASE / "my_watchlist.txt"
 EXTRA_INDEX_FILE = BASE / "index_tickers.txt"   # optional fallback universe
 
-INDEX_SOURCES = {
-    "S&P 500": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", ["Symbol"]),
-    "Nasdaq-100": ("https://en.wikipedia.org/wiki/Nasdaq-100", ["Ticker", "Symbol"]),
+# Stock groups. The nightly scan uses SCAN_GROUPS; backtest.py chooses its own list.
+# Each group lists one or more sources, tried in order until one works.
+UNIVERSE_SOURCES = {
+    "sp500": {"label": "S&P 500", "min": 400, "suffix": "", "sources": [
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        "https://www.slickcharts.com/sp500"]},
+    "nasdaq100": {"label": "Nasdaq-100", "min": 90, "suffix": "", "sources": [
+        "https://en.wikipedia.org/wiki/Nasdaq-100",
+        "https://www.slickcharts.com/nasdaq100",
+        "file:nasdaq100_fallback.txt"]},
+    "sp400": {"label": "Mid cap (S&P 400)", "min": 300, "suffix": "", "sources": [
+        "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"]},
+    "sp600": {"label": "Small cap (S&P 600)", "min": 400, "suffix": "", "sources": [
+        "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"]},
+    "adrs": {"label": "International (US-listed)", "min": 1, "suffix": "", "sources": [
+        "file:international_tickers.txt"]},
+    "tsx60": {"label": "Canada (TSX 60)", "min": 50, "suffix": ".TO", "sources": [
+        "https://en.wikipedia.org/wiki/S%26P/TSX_60"]},
+    "ftse100": {"label": "UK (FTSE 100)", "min": 80, "suffix": ".L", "sources": [
+        "https://en.wikipedia.org/wiki/FTSE_100_Index"]},
+    "dax": {"label": "Germany (DAX)", "min": 30, "suffix": ".DE", "sources": [
+        "https://en.wikipedia.org/wiki/DAX"]},
 }
+SCAN_GROUPS = ["sp500", "nasdaq100"]   # add "sp400", "sp600", "adrs", "tsx60" to widen the nightly scan
 
 ZONE_NAMES = {1: "IBV", 2: "SM", -1: "IBS", -2: "SMS", 0: ""}
 
 
 # ── Universe ────────────────────────────────────────────────────────────────
-def normalize(t: str) -> str:
-    t = t.strip().upper()
+def normalize(t: str, suffix: str = "") -> str:
+    t = str(t).strip().upper().replace(" ", "")
+    if suffix:
+        if t.endswith(suffix.upper()):
+            return t
+        return t.replace(".", "-") + suffix          # BT.A -> BT-A.L, BBD.B -> BBD-B.TO
     # Class shares: BRK.B -> BRK-B (Yahoo format). Exchange suffixes like SHOP.TO stay.
     if re.fullmatch(r"[A-Z]+\.[A-Z]", t):
         t = t.replace(".", "-")
@@ -93,31 +117,42 @@ def _find_col(columns, *keys, exclude=()):
     return None
 
 
-def fetch_index(url: str, cols: list[str]) -> tuple[list[str], dict[str, dict]]:
+VALID = re.compile(r"[A-Z0-9]{1,6}([.-][A-Z0-9]{1,3})?(\.[A-Z]{1,3})?")
+
+
+def fetch_index(url: str, suffix: str = "", min_rows: int = 30) -> tuple[list[str], dict[str, dict]]:
     """Returns (tickers, meta) where meta[ticker] = {name, sector, industry}."""
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; IBV-SM-Scanner/1.0)"}, timeout=30)
+    if url.startswith("file:"):
+        tick = read_list(BASE / url[5:])
+        return tick, {}
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) IBV-SM-Scanner/1.0"},
+                     timeout=30)
     r.raise_for_status()
     tables = []
     for kw in ({"attrs": {"id": "constituents"}}, {}):  # member table first, then every table
-        try:
-            tables += pd.read_html(StringIO(r.text), flavor="lxml", **kw)
-        except Exception:  # noqa: BLE001  (no match / parser quirks)
-            pass
+        for flavor in ("lxml", "bs4"):
+            try:
+                tables += pd.read_html(StringIO(r.text), flavor=flavor, **kw)
+                break
+            except Exception:  # noqa: BLE001  (no match / parser quirks)
+                continue
+    seen_cols = []
     for table in tables:
-        if len(table) < 90:
-            continue
         if isinstance(table.columns, pd.MultiIndex):
             table.columns = [" ".join(map(str, c)) for c in table.columns]
-        tcol = _find_col(table.columns, *[c.lower() for c in cols], "ticker", "symbol")
+        seen_cols.append([str(c) for c in table.columns][:6])
+        if len(table) < min_rows:
+            continue
+        tcol = _find_col(table.columns, "ticker", "symbol", "epic")
         if tcol is None:
             continue
-        ncol = _find_col(table.columns, "security", "company", "name")
+        ncol = _find_col(table.columns, "security", "company", "name", exclude=("ticker", "symbol"))
         scol = _find_col(table.columns, "sector")
         icol = _find_col(table.columns, "sub-industry", "industry")
         tickers, meta = [], {}
         for _, row in table.iterrows():
-            t = normalize(str(row[tcol]))
-            if not re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", t):
+            t = normalize(row[tcol], suffix)
+            if not VALID.fullmatch(t):
                 continue
             tickers.append(t)
             meta[t] = {
@@ -125,9 +160,9 @@ def fetch_index(url: str, cols: list[str]) -> tuple[list[str], dict[str, dict]]:
                 "sector": str(row[scol]) if scol is not None else "",
                 "industry": str(row[icol]) if icol is not None else "",
             }
-        if len(tickers) >= 90:
+        if len(tickers) >= min_rows:
             return tickers, meta
-    raise ValueError("ticker table not found")
+    raise ValueError(f"no ticker table with {min_rows}+ rows; tables seen: {seen_cols[:6]}")
 
 
 def fetch_meta_yahoo(tickers: list[str]) -> dict[str, dict]:
@@ -148,24 +183,42 @@ def fetch_meta_yahoo(tickers: list[str]) -> dict[str, dict]:
     return out
 
 
-def build_universe() -> tuple[list[str], list[str], list[str], dict[str, dict]]:
-    """Returns (all_tickers, watchlist, notes, meta)."""
+def build_universe(groups: list[str] | None = None) -> tuple[list[str], list[str], list[str], dict[str, dict]]:
+    """Returns (all_tickers, watchlist, notes, meta). meta[t]['groups'] = group labels the stock belongs to."""
+    groups = groups or SCAN_GROUPS
     notes, index, meta = [], [], {}
-    for name, (url, cols) in INDEX_SOURCES.items():
-        try:
-            tick, m = fetch_index(url, cols)
+    for g in groups:
+        cfg = UNIVERSE_SOURCES[g]
+        loaded = False
+        for src in cfg["sources"]:
+            try:
+                tick, m = fetch_index(src, cfg["suffix"], cfg["min"])
+            except Exception as e:  # noqa: BLE001
+                print(f"{cfg['label']} from {src}: {e!r}", file=sys.stderr)
+                continue
+            for t in tick:
+                meta.setdefault(t, {"name": "", "sector": "", "industry": ""})
+                for k, v in m.get(t, {}).items():
+                    if v and not meta[t].get(k):
+                        meta[t][k] = v
+                meta[t].setdefault("groups", [])
+                if cfg["label"] not in meta[t]["groups"]:
+                    meta[t]["groups"].append(cfg["label"])
             index += tick
-            for k, v in m.items():
-                meta.setdefault(k, v)
-            notes.append(f"{name}: {len(tick)} symbols")
-        except Exception as e:  # noqa: BLE001
-            notes.append(f"{name}: could not load ({e.__class__.__name__})")
-            print(f"{name} load error: {e!r}", file=sys.stderr)
+            notes.append(f"{cfg['label']}: {len(tick)} symbols")
+            loaded = True
+            break
+        if not loaded:
+            notes.append(f"{cfg['label']}: could not load")
     if not index:
         index = read_list(EXTRA_INDEX_FILE)
         if index:
             notes.append(f"Used fallback index_tickers.txt: {len(index)} symbols")
     watch = read_list(WATCHLIST_FILE)
+    for t in watch:
+        meta.setdefault(t, {"name": "", "sector": "", "industry": ""}).setdefault("groups", [])
+        if "Watchlist" not in meta[t]["groups"]:
+            meta[t]["groups"].append("Watchlist")
     seen, universe = set(), []
     for t in watch + index:
         if t not in seen:
@@ -197,6 +250,11 @@ def download(tickers: list[str]) -> dict[str, pd.DataFrame]:
             # Crypto trades 24/7: drop the still-forming UTC day
             if t.endswith("-USD") and len(sub) and pd.Timestamp(sub.index[-1]).date() >= today_utc:
                 sub = sub.iloc[:-1]
+            # Bad-data guard: a one-day jump of +300% or drop of 90% is almost always a unit/split glitch
+            chg = sub["Close"].pct_change().dropna()
+            if len(chg) and (chg.max() > 3.0 or chg.min() < -0.9):
+                print(f"skipping {t}: suspicious one-day price jump", file=sys.stderr)
+                continue
             if len(sub) >= SMA_LEN + 2 * PIVOT_LEN:
                 data[t] = sub
 
