@@ -882,21 +882,28 @@ strategies to each other and to SPY, and expect less in live trading.<br>
 </body></html>"""
 
     out = S.drop(columns=["spy_up"]).round({"entry": 4, "stop": 4, "exit": 4, "ret_pct": 3, "rsi": 1})
-    csv_bytes = out.to_csv(index=False).encode()
-    (BASE / "backtest_trades.csv").write_bytes(csv_bytes)
+    raw_csv = out.to_csv(index=False).encode()
+    (BASE / "backtest_trades.csv").write_bytes(raw_csv)
+    import zipfile
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        z.writestr("backtest_trades.csv", raw_csv)
+    csv_bytes = zbuf.getvalue()
+    print(f"Trade list: {len(out):,} rows, {len(raw_csv) / 1e6:.1f} MB ({len(csv_bytes) / 1e6:.1f} MB zipped)")
+    # A copy of the report that opens on its own (charts as files) for the GitHub artifact
+    file_body = body
+    for cid, png in images:
+        (BASE / f"{cid}.png").write_bytes(png)
+        file_body = file_body.replace(f"cid:{cid}", f"{cid}.png")
+    (BASE / "backtest_report.html").write_text(file_body)
     subject = (f"IBV/SM Backtest v3: {'best' if best_ok else 'top Sharpe (unproven)'} = {best_key} "
                f"{STRATS[best_key.split('-')[0]]['name']} · "
                f"CAGR {best['CAGR %']:.1f}% vs SPY {spy_perf['CAGR %']:.1f}% · Sharpe {best['Sharpe']:.2f} vs {spy_perf['Sharpe']:.2f}")
 
     if os.environ.get("DRY_RUN") == "1" or not os.environ.get("EMAIL_USER"):
-        for cid, png in images:
-            (BASE / f"{cid}.png").write_bytes(png)
-            body = body.replace(f"cid:{cid}", f"{cid}.png")
-        (BASE / "backtest_report.html").write_text(body)
         print(f"DRY RUN: {subject}")
     else:
-        (BASE / "backtest_report.html").write_text(body)
-        s.send_email(subject, body, csv_bytes, images, csv_name="backtest_trades.csv")
+        s.send_email(subject, body, csv_bytes, images, csv_name="backtest_trades.zip")
         print(f"Emailed: {subject}")
     return 0
 
