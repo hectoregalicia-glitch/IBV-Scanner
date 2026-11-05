@@ -97,11 +97,12 @@ def fetch_index(url: str, cols: list[str]) -> tuple[list[str], dict[str, dict]]:
     """Returns (tickers, meta) where meta[ticker] = {name, sector, industry}."""
     r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; IBV-SM-Scanner/1.0)"}, timeout=30)
     r.raise_for_status()
-    try:  # Wikipedia marks the member table with id="constituents" on both pages
-        tables = pd.read_html(StringIO(r.text), attrs={"id": "constituents"})
-    except ValueError:
-        tables = []
-    tables += pd.read_html(StringIO(r.text))
+    tables = []
+    for kw in ({"attrs": {"id": "constituents"}}, {}):  # member table first, then every table
+        try:
+            tables += pd.read_html(StringIO(r.text), flavor="lxml", **kw)
+        except Exception:  # noqa: BLE001  (no match / parser quirks)
+            pass
     for table in tables:
         if len(table) < 90:
             continue
