@@ -64,8 +64,8 @@ UNIVERSE_SOURCES = {
         "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
         "https://www.slickcharts.com/sp500"]},
     "nasdaq100": {"label": "Nasdaq-100", "min": 90, "suffix": "", "sources": [
-        "https://en.wikipedia.org/wiki/Nasdaq-100",
         "https://www.slickcharts.com/nasdaq100",
+        "https://en.wikipedia.org/wiki/Nasdaq-100",
         "file:nasdaq100_fallback.txt"]},
     "sp400": {"label": "Mid cap (S&P 400)", "min": 300, "suffix": "", "sources": [
         "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"]},
@@ -88,6 +88,8 @@ ZONE_NAMES = {1: "IBV", 2: "SM", -1: "IBS", -2: "SMS", 0: ""}
 # ── Universe ────────────────────────────────────────────────────────────────
 def normalize(t: str, suffix: str = "") -> str:
     t = str(t).strip().upper().replace(" ", "")
+    if t in ("NAN", "NONE", ""):
+        return "INVALID!"
     if suffix:
         if t.endswith(suffix.upper()):
             return t
@@ -228,6 +230,18 @@ def build_universe(groups: list[str] | None = None) -> tuple[list[str], list[str
 
 
 # ── Data ────────────────────────────────────────────────────────────────────
+def has_glitch(c: np.ndarray) -> bool:
+    if len(c) < 5:
+        return False
+    r = c[1:] / c[:-1]
+    for i in np.where((r > 2.5) | (r < 0.4))[0]:
+        before = c[i]                                   # close before the jump
+        after = c[i + 2:i + 5]                          # 1-3 days after the jump day
+        if len(after) and np.any(np.abs(after / before - 1) < 0.3):
+            return True                                 # spiked and came straight back
+    return False
+
+
 def download(tickers: list[str]) -> dict[str, pd.DataFrame]:
     import yfinance as yf
 
@@ -250,10 +264,10 @@ def download(tickers: list[str]) -> dict[str, pd.DataFrame]:
             # Crypto trades 24/7: drop the still-forming UTC day
             if t.endswith("-USD") and len(sub) and pd.Timestamp(sub.index[-1]).date() >= today_utc:
                 sub = sub.iloc[:-1]
-            # Bad-data guard: a one-day jump of +300% or drop of 90% is almost always a unit/split glitch
-            chg = sub["Close"].pct_change().dropna()
-            if len(chg) and (chg.max() > 3.0 or chg.min() < -0.9):
-                print(f"skipping {t}: suspicious one-day price jump", file=sys.stderr)
+            # Bad-data guard: skip a stock only if it has a glitch-like spike, i.e. a huge one-day
+            # move (+150% or -60%) that snaps back within 3 days. Real big moves that stick are kept.
+            if has_glitch(sub["Close"].to_numpy(float)):
+                print(f"skipping {t}: price data glitch (spike that reverses)", file=sys.stderr)
                 continue
             if len(sub) >= SMA_LEN + 2 * PIVOT_LEN:
                 data[t] = sub
@@ -816,8 +830,14 @@ def send_email(subject: str, body: str, csv_bytes: bytes, images: list[tuple[str
     html_part = msg.get_payload()[1]
     for cid, png in images:
         html_part.add_related(png, maintype="image", subtype="png", cid=f"<{cid}>")
-    msg.add_attachment(csv_bytes, maintype="text", subtype="csv",
-                       filename=csv_name or f"ibv_scan_{dt.date.today().isoformat()}.csv")
+    name = csv_name or f"ibv_scan_{dt.date.today().isoformat()}.csv"
+    if len(csv_bytes) > 18 * 1024 * 1024:
+        print(f"Attachment {name} is {len(csv_bytes) / 1e6:.0f} MB, too big for Gmail; not attached "
+              "(download it from the run's Artifacts on GitHub).", file=sys.stderr)
+    elif name.endswith(".zip"):
+        msg.add_attachment(csv_bytes, maintype="application", subtype="zip", filename=name)
+    else:
+        msg.add_attachment(csv_bytes, maintype="text", subtype="csv", filename=name)
     ctx = ssl.create_default_context()
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=60) as s:
