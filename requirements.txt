@@ -4,3 +4,5 @@ numpy>=1.26
 requests>=2.32
 lxml>=5.0
 matplotlib>=3.8
+beautifulsoup4>=4.12
+html5lib>=1.1
